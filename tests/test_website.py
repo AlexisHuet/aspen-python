@@ -1,5 +1,4 @@
 import os
-import datetime
 
 from aspen.testing import handle, StubRequest
 from aspen.testing.fsfix import attach_teardown, FSFIX, mk
@@ -74,7 +73,7 @@ def bar(response):
     response.request
 """)
       , ( '.aspen/configure-aspen.py'
-        , 'import foo\nwebsite.hooks.outbound_late.register(foo.bar)'
+        , 'import foo\nwebsite.hooks.outbound.append(foo.bar)'
          )
       , ('index.html', "raise heck")
        )
@@ -89,6 +88,21 @@ def bar(response):
     expected = 500
     actual = response.code
     assert actual == expected, actual
+
+
+def test_website_doesnt_clobber_outbound():
+    mk( ( '.aspen/configure-aspen.py'
+        , 'import random\nwebsite.hooks.outbound.append(random.choice)'
+         )
+       )
+
+    project_root = os.path.join(FSFIX, '.aspen')
+    website = Website(['--www_root='+FSFIX, '--project_root='+project_root])
+
+    expected = 2
+    actual = len(website.hooks.outbound)
+    assert actual == expected, actual
+
 
 
 attach_teardown(globals())

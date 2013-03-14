@@ -29,29 +29,52 @@ class Website(Configurable):
         """
         self.configure(argv)
 
+
     def __call__(self, environ, start_response):
         """WSGI interface.
         """
         request = Request.from_wsgi(environ) # too big to fail :-/
+        request.website = self
         response = self.handle_safely(request)
         response.request = request # Stick this on here at the last minute
                                    # in order to support close hooks.
         return response(environ, start_response)
 
+
+    # Interface for Server
+    # ====================
+
     def start(self):
         aspen.log_dammit("Starting up Aspen website.")
-        self.hooks.startup.run(self)
+        self.hooks.run('startup', self)
         self.network_engine.start()
 
     def stop(self):
         aspen.log_dammit("Shutting down Aspen website.")
-        self.hooks.shutdown.run(self)
+        self.hooks.run('shutdown', self)
         self.network_engine.stop()
 
-    def handler(self, request):
+
+    # Request Handling
+    # ================
+
+    def handle_safely(self, request):
+        """Given an Aspen request, return an Aspen response.
+        """
+        try:
+            request = self.do_inbound(request)
+            response = self.handle(request)
+        except:
+            response = self.handle_error(request)
+
+        response = self.do_outbound(response)
+        return response
+
+
+    def handle(self, request):
         """Given an Aspen request, return an Aspen response.
 
-        The default handler uses Resource subclasses to generate responses from
+        By default we use Resource subclasses to generate responses from
         simplates on the filesystem. See aspen/resources/__init__.py.
 
         You can monkey-patch this method to implement single-page web apps or
@@ -62,11 +85,11 @@ class Website(Configurable):
             def greetings_program(website, request):
                 return Response(200, "Greetings, program!")
 
-            website.handler = greetings_program
+            website.handle = greetings_program
+
+        Unusual but allowed.
 
         """
-        self.run_inbound(request)
-
         # Look for a Socket.IO socket (http://socket.io/).
         if isinstance(request.socket, Response):    # handshake
             response = request.socket
@@ -76,81 +99,151 @@ class Website(Configurable):
             response = request.resource.respond(request)
         else:                                       # socket
             response = request.socket.respond(request)
+        response.request = request
         return response
 
 
-    def run_inbound(self, request):
-        """Factored out to support testing.
-        """
-        self.hooks.inbound_early.run(request)
-        self.check_auth(request)
-        dispatcher.dispatch(request)  # sets request.fs
+    # Inbound
+    # =======
+
+    def do_inbound(self, request):
+        request = self.hooks.run('inbound_early', request)
+        request = self.hooks.run('inbound_core', request)
+        request = self.hooks.run('inbound_late', request)
+        return request
+
+    def reset_inbound_core(self):
+        self.hooks.inbound_core = [ self.set_fs_etc
+                                  , self.set_socket
+                                   ]
+
+    def set_fs_etc(self, request):
+        dispatcher.dispatch(request)  # mutates request
+
+    def set_socket(self, request):
         request.socket = sockets.get(request)
-        self.hooks.inbound_late.run(request)
 
 
-    def handle_safely(self, request):
-        """Given an Aspen request, return an Aspen response.
-        """
-        try:
-            try:
-                #self.copy_configuration_to(request)
-                request.website = self
-                response = self.handler(request)
-            except:
-                response = self.handle_error_nicely(request)
-        except Response, response:
-            # Grab the response object in the case where it was raised.  In the
-            # case where it was returned, response is set in a try block above.
-            pass
-        else:
-            # If the response object is coming from handle_error via except
-            # Response, then it already has request on it and the early hooks
-            # have already been run. If it fell off the edge un-exceptionally,
-            # we need to take care of those two things.
-            response.request = request
-            self.hooks.outbound_early.run(response)
+    # Error
+    # =====
 
-        self.hooks.outbound_late.run(response)
-        self.dont_cache_authed(request, response)
-        self.log_access(request, response) # TODO is this at the right level?
-        return response
-
-    def handle_error_nicely(self, request):
-        """Try to provide some nice error handling.
+    def handle_error(self, request):
+        """Given a request, return a response.
         """
         try:                        # nice error messages
-            tb_1 = traceback.format_exc()
-            response = sys.exc_info()[1]
-            if not isinstance(response, Response):
-                aspen.log_dammit(tb_1)
-                response = Response(500, tb_1)
-            elif 200 <= response.code < 300:
-                return response
+            tb_1 = self.log_error()
+            request = self.hooks.run('error_early', request)
+            response = self.handle_error_nicely(tb_1, request)
+        except Response, response:  # error simplate raised Response
+            pass
+        except:                     # last chance for tracebacks in the browser
+            response = self.handle_error_at_all(tb_1)
+
+        response.request = request
+        response = self.hooks.run('error_late', response)
+        return response
+
+
+    def log_error(self):
+        tb_1 = traceback.format_exc()
+        aspen.log_dammit(tb_1)
+        return tb_1
+
+
+    def handle_error_nicely(self, tb_1, request):
+
+        response = sys.exc_info()[1]
+
+        if not isinstance(response, Response):
+
+            # We have a true Exception; convert it to a Response object.
+
+            response = Response(500, tb_1)
             response.request = request
-            self.hooks.outbound_early.run(response)
+
+        if 200 <= response.code < 300:
+
+            # The app raised a Response(2xx). Act as if nothing
+            # happened. This is unusual but allowed.
+
+            pass
+
+        else:
+
+            # Delegate to any error simplate.
+            # ===============================
+
             fs = self.ours_or_theirs(str(response.code) + '.html')
             if fs is None:
                 fs = self.ours_or_theirs('error.html')
-            if fs is None:
-                raise
-            request.fs = fs
-            request.original_resource = request.resource
-            request.resource = resources.get(request)
-            response = request.resource.respond(request, response)
-            return response
-        except Response, response:  # no nice error simplate available
-            raise
-        except:                     # last chance for tracebacks in the browser
-            tb_2 = traceback.format_exc().strip()
-            tbs = '\n\n'.join([tb_2, "... while handling ...", tb_1])
-            aspen.log_dammit(tbs)
-            if self.show_tracebacks:
-                response = Response(500, tbs)
-            else:
-                response = Response(500)
-            response.request = request
-            raise response
+            if fs is not None:
+                request.fs = fs
+                request.original_resource = request.resource
+                request.resource = resources.get(request)
+                response = request.resource.respond(request, response)
+
+        return response
+
+
+    def handle_error_at_all(self, tb_1):
+        tb_2 = traceback.format_exc().strip()
+        tbs = '\n\n'.join([tb_2, "... while handling ...", tb_1])
+        aspen.log_dammit(tbs)
+        if self.show_tracebacks:
+            response = Response(500, tbs)
+        else:
+            response = Response(500)
+        return response
+
+
+    # Outbound
+    # ========
+
+    def do_outbound(self, response):
+        response = self.hooks.run('outbound', response)
+        return response
+
+    def reset_outbound(self):
+        self.hooks.outbound = [self.log_access]
+
+    def log_access(self, response):
+        """Log access. With our own format (not Apache's).
+        """
+
+        if self.logging_threshold > 0: # short-circuit
+            return
+
+
+        # What was the URL path translated to?
+        # ====================================
+
+        fs = getattr(response.request, 'fs', '')
+        if fs.startswith(self.www_root):
+            fs = fs[len(self.www_root):]
+            if fs:
+                fs = '.'+fs
+        else:
+            fs = '...' + fs[-21:]
+        msg = "%-24s %s" % (response.request.line.uri.path.raw, fs)
+
+
+        # Where was response raised from?
+        # ===============================
+
+        filename, linenum = response.whence_raised()
+        if filename is not None:
+            response = "%s (%s:%d)" % (response, filename, linenum)
+        else:
+            response = str(response)
+
+        # Log it.
+        # =======
+
+        aspen.log("%-36s %s" % (response, msg))
+
+
+    # File Resolution
+    # ===============
 
     def find_ours(self, filename):
         """Given a filename, return a filepath.
@@ -171,68 +264,11 @@ class Website(Configurable):
 
         return None
 
-    def check_auth(self, request):
-        """Raise 401 if there's no authenticated user.
-
-        The user can set website.protected
-
-        """
-        if self.protected and request.context['user'].ANON:
-            raise Response(401)
-
-    def dont_cache_authed(self, request, response):
-        """Given request and response, modify response.
-
-        We never want to allow caching responses for authenticated requests, to
-        avoid leaking one user's data to a different user.
-
-        """
-        if self.protected and not request.context['user'].ANON:
-            response.headers['Expires'] = THE_PAST  # don't cache
-
-    def log_access(self, request, response):
-        """Log access. With our own format (not Apache's).
-        """
-
-        if self.logging_threshold > 0: # short-circuit
-            return
-
-
-        # What was the URL path translated to?
-        # ====================================
-
-        fs = getattr(request, 'fs', '')
-        if fs.startswith(self.www_root):
-            fs = fs[len(self.www_root):]
-            if fs:
-                fs = '.'+fs
-        else:
-            fs = '...' + fs[-21:]
-        msg = "%-24s %s" % (request.line.uri.path.raw, fs)
-
-
-        # Where was response raised from?
-        # ===============================
-
-        tb = sys.exc_info()[2]
-        if tb is not None:
-            while tb.tb_next is not None:
-                tb = tb.tb_next
-            frame = tb.tb_frame
-            filename = tb.tb_frame.f_code.co_filename.split(os.sep)[-1]
-            response = "%s (%s:%d)" % (response, filename, frame.f_lineno)
-        else:
-            response = str(response)
-
-
-        # Log it.
-        # =======
-
-        aspen.log("%-36s %s" % (response, msg))
-
 
     # Conveniences for testing
     # ========================
+    # XXX Sure seems like this class should be refactored so we use the same
+    # code for both testing and production here.
 
     def serve_request(self, path):
         """Given an URL path, return response.
@@ -250,7 +286,7 @@ class Website(Configurable):
             request = Request(uri=path)
         if not hasattr(request, 'website'):
             request.website = self
-        self.run_inbound(request)
+        self.do_inbound(request)
         resource = resources.get(request)
         if return_request_too:
             return resource, request
