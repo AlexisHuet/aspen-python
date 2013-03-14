@@ -41,6 +41,8 @@ def _typecast(key, value):
     else:                       # otherwise it's URL-quoted ASCII
         try:
             value = value.decode('ASCII')
+        except UnicodeEncodeError:
+            pass
         except UnicodeDecodeError:
             raise Response(400)
     debug(lambda: "typecasted " + key + ", " + repr(value))
